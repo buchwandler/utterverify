@@ -218,3 +218,5 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+utterverify/_version.py
+context_utterverify*.*

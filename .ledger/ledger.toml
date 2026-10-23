@@ -1,0 +1,18 @@
+schema_version = 3
+
+[project]
+uuid = "6c47d374-a6eb-4748-acb8-1e8d6c44106d"
+name = "utterverify"
+
+[ledgers.taskledger.mounts.data]
+storage = "external"
+root = "../ledger"
+
+[ledgers.taskledger.mounts.runtime]
+storage = "user-data"
+
+[ledgers.taskledger.mounts.logs]
+storage = "user-data"
+
+[ledgers.taskledger.mounts.indexes]
+storage = "cache"

@@ -1,0 +1,75 @@
+[build-system]
+requires = ["setuptools>=80", "setuptools-scm>=9.2", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "utterverify"
+dynamic = ["version"]
+description = "Optional SpeechScope validation gate between VoiceRender and AudioCompose"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+authors = [{name = "buchwandler"}]
+keywords = ["speech", "tts", "validation", "speechscope", "renderplan", "audio"]
+dependencies = [
+  "renderplan>=0.1.2,<0.2",
+  "speechscope>=0.1.1,<0.2",
+  "tomlkit>=0.13,<1",
+]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Multimedia :: Sound/Audio :: Analysis",
+  "Typing :: Typed",
+]
+
+[project.optional-dependencies]
+redux = ["speechscope[redux]>=0.1.0,<0.2"]
+dev = [
+  "build>=1.2",
+  "mypy>=1.13",
+  "pytest>=8",
+  "ruff>=0.12",
+  "setuptools-scm>=9.2",
+  "twine>=6",
+]
+
+[project.scripts]
+utterverify = "utterverify.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/buchwandler/utterverify"
+Repository = "https://github.com/buchwandler/utterverify"
+Issues = "https://github.com/buchwandler/utterverify/issues"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["utterverify*"]
+exclude = ["tests*"]
+
+[tool.setuptools.package-data]
+utterverify = ["py.typed"]
+
+[tool.setuptools_scm]
+version_file = "utterverify/_version.py"
+version_scheme = "guess-next-dev"
+local_scheme = "node-and-date"
+fallback_version = "0.1.dev0"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.mypy]
+python_version = "3.12"
+files = ["utterverify"]
+ignore_missing_imports = true
+warn_unused_configs = true
