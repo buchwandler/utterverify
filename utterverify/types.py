@@ -59,6 +59,13 @@ class BundleVerifyResult:
     status: UnitStatus
     fail_on_review: bool = False
 
+    speechscope_backend: str = "redux"
+    speechscope_device: str = "cpu"
+    speechscope_model: str | None = None
+    normalization: str = "basic-v1"
+    use_language_hint: bool = False
+    config_sha256: str | None = None
+
     @property
     def segments(self) -> int:
         return sum(len(unit.segments) for unit in self.units)

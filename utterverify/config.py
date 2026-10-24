@@ -18,6 +18,13 @@ CONFIG_FORMAT = "utterverify.config"
 CONFIG_SCHEMA_VERSION = 1
 
 
+class _UnsetType:
+    """Sentinel distinguishing an omitted setting from an explicit unset."""
+
+
+UNSET = _UnsetType()
+
+
 @dataclass(frozen=True, slots=True)
 class VerifyConfig:
     backend: str = "redux"
@@ -205,3 +212,50 @@ def _atomic_text(path: Path, content: str) -> None:
     finally:
         if temp_name is not None and os.path.exists(temp_name):
             os.unlink(temp_name)
+
+
+def update_config(
+    path: str | Path,
+    *,
+    backend: str | None = None,
+    device: str | None = None,
+    model: str | None | _UnsetType = UNSET,
+    normalization: str | None = None,
+    use_language_hint: bool | None = None,
+    fail_on_review: bool | None = None,
+    fail_fast: bool | None = None,
+) -> VerifyConfig:
+    """Update only supplied config keys, preserving unrelated TOML content."""
+    target = Path(path)
+    if not target.exists():
+        write_config(target, default_config())
+    load_config(target)
+    try:
+        document = tomlkit.parse(target.read_text(encoding="utf-8"))
+    except (OSError, tomlkit.exceptions.ParseError) as exc:
+        raise ConfigError(f"cannot update configuration {target}: {exc}") from exc
+
+    if "run" not in document:
+        document["run"] = tomlkit.table()
+    speechscope = document["speechscope"]
+    run = document["run"]
+    if backend is not None:
+        speechscope["backend"] = backend
+    if device is not None:
+        speechscope["device"] = device
+    if model is not UNSET:
+        if model is None:
+            speechscope.pop("model", None)
+        else:
+            speechscope["model"] = model
+    if normalization is not None:
+        speechscope["normalization"] = normalization
+    if use_language_hint is not None:
+        speechscope["use_language_hint"] = use_language_hint
+    if fail_on_review is not None:
+        run["fail_on_review"] = fail_on_review
+    if fail_fast is not None:
+        run["fail_fast"] = fail_fast
+
+    _atomic_text(target, tomlkit.dumps(document))
+    return load_config(target)

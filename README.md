@@ -33,15 +33,74 @@ book.ssmd-bundle/
 └── audiocompose/
 ```
 
+## Bundle workflow
+
 The first UtterVerify-owned artifact is always `utterverify.toml`. `bundle verify`
-automatically creates it before loading a RenderPlan or opening a SpeechScope backend.
-You can also create/edit it explicitly before validation:
+creates the selected variant's config before loading a RenderPlan or opening SpeechScope.
+When the bundle contains exactly one complete variant in both `renderplan/` and
+`voicerender/`, `--variant` is optional. Symlinked variants are not followed. If there are
+multiple complete variants, UtterVerify lists them and requires explicit `--variant`
+selection; stale `utterverify/` output never selects an input variant.
+
+For a bundle with one rendered variant, configure and run the gate like this:
 
 ```bash
-utterverify bundle init novel.ssmd-bundle --variant narration--28f616b6fe3b
-$EDITOR novel.ssmd-bundle/utterverify/narration--28f616b6fe3b/utterverify.toml
-utterverify bundle verify novel.ssmd-bundle --variant narration--28f616b6fe3b
+# Backend and target model are stored in utterverify.toml.
+utterverify bundle configure novel.ssmd-bundle \
+  --engine whispercpp \
+  --model whispercpp:tiny.en-q5_1
+
+# Installation and model-weight management belong to SpeechScope.
+speechscope models install whispercpp:tiny.en-q5_1
+
+# Doctor checks local readiness without inference or writes.
+utterverify doctor novel.ssmd-bundle
+
+# Variant is inferred because there is exactly one complete candidate.
+utterverify bundle verify novel.ssmd-bundle --chapters 5-17
 ```
+
+`--engine` is a user-friendly alias for `--backend`; both update the canonical
+`[speechscope].backend` key. Managed model references are preferred. Existing local model
+files are supported and saved as absolute paths when configured. UtterVerify never downloads
+or installs model weights. `bundle configure` can also update device, normalization,
+language-hint and review/fail-fast policy flags while preserving threshold settings.
+
+If no config exists, `bundle configure` creates the defaults and applies the supplied
+settings. `bundle init` remains available for creating a default or explicitly selected
+config. If the bundle contains multiple complete variants, specify one for configure,
+doctor, init, and verify:
+
+```bash
+utterverify bundle configure novel.ssmd-bundle \
+  --variant narration--28f616b6fe3b \
+  --engine whispercpp \
+  --model whispercpp:tiny.en-q5_1
+
+utterverify doctor novel.ssmd-bundle --variant narration--28f616b6fe3b
+utterverify bundle verify novel.ssmd-bundle \
+  --variant narration--28f616b6fe3b \
+  --chapters 5-17
+```
+
+For direct environment checks, `utterverify doctor` can use an optional config file and
+temporary overrides:
+
+```bash
+utterverify doctor --config ./utterverify.toml --backend redux
+utterverify doctor --engine whispercpp --model whispercpp:tiny.en-q5_1 --json
+```
+
+Doctor performs no inference, config creation, report writes, model downloads, or installs.
+For whisper.cpp it checks both `whisper-cli` and the selected model; an executable without
+a model is not ready, and an installed model without the executable is not ready. A model
+may come from `--model`, the config, or `SPEECHSCOPE_WHISPERCPP_MODEL` (in that order).
+Environment-sourced models are reported as such and warned as unpinned. Configure a
+reproducible bundle model with `bundle configure`. `SPEECHSCOPE_WHISPERCPP_BIN` is honored
+by the same SpeechScope executable probe used by its backend. Redux readiness is a
+side-effect-free dependency metadata preflight and does not prove full runtime/device
+readiness. Doctor exits 0 when ready, 3 when the selected runtime is not ready, and 2 for
+invalid config or bundle input.
 
 Then continue with composition only if the gate succeeds:
 
@@ -49,15 +108,8 @@ Then continue with composition only if the gate succeeds:
 audiocompose bundle compose novel.ssmd-bundle --variant narration--28f616b6fe3b
 ```
 
-Book chapter selection mirrors the upstream source-number style:
-
-```bash
-utterverify bundle verify novel.ssmd-bundle \
-  --variant narration--28f616b6fe3b \
-  --chapters 5-17
-```
-
-Document bundles accept only `--chapters all`.
+Book chapter selection uses source chapter numbers (`all`, `5`, `5-17`, or `5,7,10-12`),
+not array indexes. Document bundles accept only `--chapters all`.
 
 ## Default policy
 

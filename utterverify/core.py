@@ -5,11 +5,11 @@ from __future__ import annotations
 import hashlib
 import json
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from .config import CONFIG_FILENAME, VerifyConfig, ensure_config, load_config
 from .errors import HandoffError
-from .types import SegmentOutcome, UnitVerifyResult
+from .types import SegmentOutcome, SegmentStatus, UnitStatus, UnitVerifyResult
 
 RENDER_MANIFEST_FILENAME = "render-manifest.toml"
 
@@ -30,9 +30,22 @@ def verify_renderplan(
     """
     plan_path = Path(plan).expanduser().resolve(strict=True)
     render_root = Path(render_dir).expanduser().resolve(strict=True)
+    requested_output = Path(output_dir).expanduser()
+    if requested_output.is_symlink():
+        raise HandoffError(
+            f"UtterVerify output directory must not be a symlink: {requested_output}"
+        )
     out = Path(output_dir).expanduser().resolve(strict=False)
+    try:
+        out.relative_to(render_root)
+    except ValueError:
+        pass
+    else:
+        raise HandoffError("UtterVerify output directory must not be inside the VoiceRender input")
     out.mkdir(parents=True, exist_ok=True)
     config_path = out / CONFIG_FILENAME
+    if config_path.is_symlink():
+        raise HandoffError(f"UtterVerify config must not be a symlink: {config_path}")
     if config is None:
         selected, _ = ensure_config(config_path)
     else:
@@ -42,6 +55,7 @@ def verify_renderplan(
             selected, _ = ensure_config(config_path, config)
 
     parsed_plan, manifest = _load_handoff(plan_path, render_root)
+    preflight = _preflight_loaded(parsed_plan, manifest, render_root)
     owns_verifier = verifier is None
     entered = False
     if owns_verifier:
@@ -51,6 +65,7 @@ def verify_renderplan(
             entered = True
         except Exception as exc:
             raise HandoffError(f"SpeechScope backend failed: {exc}") from exc
+    assert verifier is not None
     try:
         return _verify_loaded(
             parsed_plan,
@@ -61,6 +76,7 @@ def verify_renderplan(
             config=selected,
             unit_id=unit_id,
             verifier=verifier,
+            preflight=preflight,
         )
     finally:
         if owns_verifier and entered:
@@ -91,6 +107,30 @@ def _load_handoff(plan_path: Path, render_root: Path) -> tuple[Any, Any]:
     return parsed_plan, manifest
 
 
+def _preflight_loaded(
+    plan: Any,
+    manifest: Any,
+    render_root: Path,
+) -> tuple[tuple[Any, str, Path], ...]:
+    """Validate all deterministic WAV paths and checksums before any ASR work."""
+    by_key = {
+        (artifact.segment_number, artifact.segment_id): artifact for artifact in manifest.speech
+    }
+    verified: list[tuple[Any, str, Path]] = []
+    for speech in plan.speech:
+        segment_id = speech.segment_id or speech.computed_id()
+        key = (speech.number, segment_id)
+        artifact = by_key.get(key)
+        if artifact is None:
+            raise HandoffError(
+                f"manifest is missing speech occurrence {speech.number}:{segment_id}"
+            )
+        verified.append(
+            (speech, segment_id, _verified_artifact_path(render_root, speech, artifact))
+        )
+    return tuple(verified)
+
+
 def _verify_loaded(
     plan: Any,
     manifest: Any,
@@ -101,25 +141,26 @@ def _verify_loaded(
     config: VerifyConfig,
     unit_id: str,
     verifier: Any,
+    preflight: tuple[tuple[Any, str, Path], ...] | None = None,
 ) -> UnitVerifyResult:
-    by_key = {(a.segment_number, a.segment_id): a for a in manifest.speech}
+    if output_dir.is_symlink():
+        raise HandoffError(f"UtterVerify output directory must not be a symlink: {output_dir}")
+    verified = (
+        preflight if preflight is not None else _preflight_loaded(plan, manifest, render_root)
+    )
     outcomes: list[SegmentOutcome] = []
-    for speech in plan.speech:
-        segment_id = speech.segment_id or speech.computed_id()
-        key = (speech.number, segment_id)
-        artifact = by_key.get(key)
-        if artifact is None:
-            raise HandoffError(
-                f"manifest is missing speech occurrence {speech.number}:{segment_id}"
-            )
-        wav = _verified_artifact_path(render_root, speech, artifact)
+    for speech, segment_id, wav in verified:
         report_path = output_dir / f"{speech.number:06d}.speechscope.json"
+        if report_path.is_symlink():
+            raise HandoffError(f"SpeechScope report output must not be a symlink: {report_path}")
         try:
             request = _verification_request(speech, wav, config)
             result = verifier.analyze(request)
-            status = str(result.evaluation.get("status", "not_evaluated"))
-            if status not in {"pass", "review", "fail", "not_evaluated"}:
-                status = "review"
+            status_value = str(result.evaluation.get("status", "not_evaluated"))
+            if status_value not in {"pass", "review", "fail", "not_evaluated"}:
+                status: SegmentStatus = "review"
+            else:
+                status = cast(SegmentStatus, status_value)
             result.write_json(report_path)
             outcomes.append(
                 SegmentOutcome(
@@ -130,7 +171,7 @@ def _verify_loaded(
                     status=status,
                 )
             )
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             outcomes.append(
                 SegmentOutcome(
                     number=speech.number,
@@ -207,7 +248,7 @@ def _verification_request(speech: Any, wav: Path, config: VerifyConfig) -> Any:
     )
 
 
-def _unit_status(outcomes: list[SegmentOutcome]) -> str:
+def _unit_status(outcomes: list[SegmentOutcome]) -> UnitStatus:
     if any(item.status == "error" for item in outcomes):
         return "error"
     if any(item.status == "fail" for item in outcomes):
