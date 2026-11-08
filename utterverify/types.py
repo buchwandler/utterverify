@@ -14,9 +14,12 @@ UnitStatus = Literal["pass", "review", "fail", "error"]
 class SegmentOutcome:
     number: int
     segment_id: str
+    reference_text: str
     wav: Path
+    wav_sha256: str
     report: Path | None
     status: SegmentStatus
+    language: str | None = None
     message: str | None = None
 
 
@@ -24,7 +27,11 @@ class SegmentOutcome:
 class UnitVerifyResult:
     id: str
     renderplan: Path
+    render_plan_id: str
+    source_plan_id: str
+    render_profile_id: str
     render_dir: Path
+    manifest_id: str | None
     output_dir: Path
     segments: tuple[SegmentOutcome, ...]
     status: UnitStatus

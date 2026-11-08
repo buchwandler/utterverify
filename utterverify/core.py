@@ -4,8 +4,12 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import tempfile
 from pathlib import Path
 from typing import Any, cast
+
+import tomlkit
 
 from .config import CONFIG_FILENAME, VerifyConfig, ensure_config, load_config
 from .errors import HandoffError
@@ -67,7 +71,7 @@ def verify_renderplan(
             raise HandoffError(f"SpeechScope backend failed: {exc}") from exc
     assert verifier is not None
     try:
-        return _verify_loaded(
+        unit_result = _verify_loaded(
             parsed_plan,
             manifest,
             plan_path=plan_path,
@@ -78,6 +82,8 @@ def verify_renderplan(
             verifier=verifier,
             preflight=preflight,
         )
+        _write_unit_report(unit_result)
+        return unit_result
     finally:
         if owns_verifier and entered:
             try:
@@ -86,24 +92,33 @@ def verify_renderplan(
                 raise HandoffError(f"SpeechScope backend failed to close: {exc}") from exc
 
 
-def _load_handoff(plan_path: Path, render_root: Path) -> tuple[Any, Any]:
+def _load_handoff(
+    plan_path: Path,
+    render_root: Path,
+    *,
+    plan_set: Any | None = None,
+    set_entry: Any | None = None,
+) -> tuple[Any, Any]:
     try:
-        from renderplan import load_manifest, load_plan
+        from renderplan import load_manifest, load_plan, validate_manifest_handoff
     except ImportError as exc:  # pragma: no cover - packaging/runtime guard
         raise HandoffError("renderplan is required to validate VoiceRender handoffs") from exc
-    manifest_path = render_root / RENDER_MANIFEST_FILENAME
-    if manifest_path.is_symlink() or not manifest_path.is_file():
-        raise HandoffError(f"complete VoiceRender manifest is missing: {manifest_path}")
+
     try:
+        if (plan_set is None) != (set_entry is None):
+            raise ValueError("RenderPlan set and chapter entry must be provided together")
         parsed_plan = load_plan(plan_path)
+        if plan_set is not None and set_entry is not None:
+            from renderplan import validate_set_chapter_plan
+
+            validate_set_chapter_plan(plan_set, set_entry, parsed_plan)
+        manifest_path = render_root / RENDER_MANIFEST_FILENAME
+        if manifest_path.is_symlink() or not manifest_path.is_file():
+            raise HandoffError(f"complete VoiceRender manifest is missing: {manifest_path}")
         manifest = load_manifest(manifest_path)
-        manifest.validate_against(parsed_plan)
+        validate_manifest_handoff(parsed_plan, manifest, require_complete=True)
     except Exception as exc:
         raise HandoffError(f"invalid RenderPlan / VoiceRender handoff: {exc}") from exc
-    if not manifest.complete:
-        raise HandoffError(
-            "VoiceRender manifest is partial; validation requires a complete handoff"
-        )
     return parsed_plan, manifest
 
 
@@ -111,12 +126,12 @@ def _preflight_loaded(
     plan: Any,
     manifest: Any,
     render_root: Path,
-) -> tuple[tuple[Any, str, Path], ...]:
+) -> tuple[tuple[Any, str, Path, str], ...]:
     """Validate all deterministic WAV paths and checksums before any ASR work."""
     by_key = {
         (artifact.segment_number, artifact.segment_id): artifact for artifact in manifest.speech
     }
-    verified: list[tuple[Any, str, Path]] = []
+    verified: list[tuple[Any, str, Path, str]] = []
     for speech in plan.speech:
         segment_id = speech.segment_id or speech.computed_id()
         key = (speech.number, segment_id)
@@ -125,9 +140,8 @@ def _preflight_loaded(
             raise HandoffError(
                 f"manifest is missing speech occurrence {speech.number}:{segment_id}"
             )
-        verified.append(
-            (speech, segment_id, _verified_artifact_path(render_root, speech, artifact))
-        )
+        wav, wav_sha256 = _verified_artifact_path(render_root, speech, artifact)
+        verified.append((speech, segment_id, wav, wav_sha256))
     return tuple(verified)
 
 
@@ -141,7 +155,7 @@ def _verify_loaded(
     config: VerifyConfig,
     unit_id: str,
     verifier: Any,
-    preflight: tuple[tuple[Any, str, Path], ...] | None = None,
+    preflight: tuple[tuple[Any, str, Path, str], ...] | None = None,
 ) -> UnitVerifyResult:
     if output_dir.is_symlink():
         raise HandoffError(f"UtterVerify output directory must not be a symlink: {output_dir}")
@@ -149,7 +163,7 @@ def _verify_loaded(
         preflight if preflight is not None else _preflight_loaded(plan, manifest, render_root)
     )
     outcomes: list[SegmentOutcome] = []
-    for speech, segment_id, wav in verified:
+    for speech, segment_id, wav, wav_sha256 in verified:
         report_path = output_dir / f"{speech.number:06d}.speechscope.json"
         if report_path.is_symlink():
             raise HandoffError(f"SpeechScope report output must not be a symlink: {report_path}")
@@ -166,35 +180,103 @@ def _verify_loaded(
                 SegmentOutcome(
                     number=speech.number,
                     segment_id=segment_id,
+                    reference_text=speech.text,
                     wav=wav,
+                    wav_sha256=wav_sha256,
                     report=report_path,
                     status=status,
+                    language=speech.language,
                 )
             )
+            if config.fail_fast and status in {"fail", "error"}:
+                break
         except Exception as exc:  # noqa: BLE001
             outcomes.append(
                 SegmentOutcome(
                     number=speech.number,
                     segment_id=segment_id,
+                    reference_text=speech.text,
                     wav=wav,
+                    wav_sha256=wav_sha256,
                     report=None,
                     status="error",
+                    language=speech.language,
                     message=str(exc),
                 )
             )
             if config.fail_fast:
                 break
+
+    if config.fail_fast and len(outcomes) < len(verified):
+        for speech, segment_id, wav, wav_sha256 in verified[len(outcomes) :]:
+            outcomes.append(
+                SegmentOutcome(
+                    number=speech.number,
+                    segment_id=segment_id,
+                    reference_text=speech.text,
+                    wav=wav,
+                    wav_sha256=wav_sha256,
+                    report=None,
+                    status="not_evaluated",
+                    language=speech.language,
+                    message="not evaluated because fail-fast stopped after an earlier failure/error",
+                )
+            )
+
     return UnitVerifyResult(
         id=unit_id,
         renderplan=plan_path,
+        render_plan_id=plan.plan_id or plan.computed_id(),
+        source_plan_id=plan.source_plan_id,
+        render_profile_id=plan.render_profile_id,
         render_dir=render_root,
+        manifest_id=getattr(manifest, "manifest_id", None),
         output_dir=output_dir,
         segments=tuple(outcomes),
         status=_unit_status(outcomes),
     )
 
 
-def _verified_artifact_path(render_root: Path, speech: Any, artifact: Any) -> Path:
+def _not_evaluated_loaded(
+    plan: Any,
+    manifest: Any,
+    *,
+    plan_path: Path,
+    render_root: Path,
+    output_dir: Path,
+    unit_id: str,
+    preflight: tuple[tuple[Any, str, Path, str], ...],
+    message: str,
+) -> UnitVerifyResult:
+    outcomes = tuple(
+        SegmentOutcome(
+            number=speech.number,
+            segment_id=segment_id,
+            reference_text=speech.text,
+            wav=wav,
+            wav_sha256=wav_sha256,
+            report=None,
+            status="not_evaluated",
+            language=speech.language,
+            message=message,
+        )
+        for speech, segment_id, wav, wav_sha256 in preflight
+    )
+    return UnitVerifyResult(
+        id=unit_id,
+        renderplan=plan_path,
+        render_plan_id=plan.plan_id or plan.computed_id(),
+        source_plan_id=plan.source_plan_id,
+        render_profile_id=plan.render_profile_id,
+        render_dir=render_root,
+        manifest_id=getattr(manifest, "manifest_id", None),
+        output_dir=output_dir,
+        segments=outcomes,
+        status="review",
+    )
+
+
+def _verified_artifact_path(render_root: Path, speech: Any, artifact: Any) -> tuple[Path, str]:
     expected_name = f"{speech.number:06d}.wav"
     if artifact.wav != expected_name or getattr(speech, "wav", expected_name) != expected_name:
         raise HandoffError(f"unexpected WAV name for speech {speech.number}")
@@ -215,7 +297,7 @@ def _verified_artifact_path(render_root: Path, speech: Any, artifact: Any) -> Pa
     got_hash = hashlib.sha256(resolved.read_bytes()).hexdigest()
     if got_hash != expected_hash:
         raise HandoffError(f"rendered WAV checksum mismatch: {candidate.name}")
-    return resolved
+    return resolved, f"sha256:{got_hash}"
 
 
 def _open_verifier(config: VerifyConfig) -> Any:
@@ -270,3 +352,68 @@ def segment_json_summary(outcome: SegmentOutcome) -> str:
         },
         ensure_ascii=False,
     )
+
+
+def _write_unit_report(result: UnitVerifyResult) -> Path:
+    report_path = result.output_dir / "utterverify-report.toml"
+    if report_path.is_symlink():
+        raise HandoffError(f"UtterVerify report must not be a symlink: {report_path}")
+
+    doc = tomlkit.document()
+    doc.add("format", "utterverify.report")
+    doc.add("schema_version", 1)
+    doc.add("id", result.id)
+    doc.add("status", result.status)
+    doc.add("renderplan", str(result.renderplan))
+    doc.add("render_plan_id", result.render_plan_id)
+    doc.add("source_plan_id", result.source_plan_id)
+    doc.add("render_profile_id", result.render_profile_id)
+    doc.add("render_dir", str(result.render_dir))
+    if result.manifest_id is not None:
+        doc.add("manifest_id", result.manifest_id)
+    doc.add("output_dir", str(result.output_dir))
+    doc.add("segments", len(result.segments))
+    doc.add("passed", result.passed)
+    doc.add("reviewed", result.reviewed)
+    doc.add("failed", result.failed)
+    doc.add("errors", result.errors)
+
+    segment_tables = tomlkit.aot()
+    for segment in result.segments:
+        table = tomlkit.table()
+        table.add("number", segment.number)
+        table.add("segment_id", segment.segment_id)
+        table.add("reference_text", segment.reference_text)
+        table.add("wav", str(segment.wav))
+        table.add("wav_sha256", segment.wav_sha256)
+        if segment.report is not None:
+            table.add("report", str(segment.report))
+        table.add("status", segment.status)
+        if segment.language is not None:
+            table.add("language", segment.language)
+        if segment.message is not None:
+            table.add("message", segment.message)
+        segment_tables.append(table)
+    doc.add("segment", segment_tables)
+    _atomic_text(report_path, tomlkit.dumps(doc))
+    return report_path
+
+
+def _atomic_text(path: Path, content: str) -> None:
+    temp_name: str | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            newline="\n",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as handle:
+            temp_name = handle.name
+            handle.write(content)
+        os.replace(temp_name, path)
+    finally:
+        if temp_name is not None and os.path.exists(temp_name):
+            os.unlink(temp_name)

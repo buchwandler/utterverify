@@ -25,7 +25,13 @@ from .config import (
     update_config,
     write_config,
 )
-from .core import _load_handoff, _open_verifier, _preflight_loaded, _verify_loaded
+from .core import (
+    _load_handoff,
+    _not_evaluated_loaded,
+    _open_verifier,
+    _preflight_loaded,
+    _verify_loaded,
+)
 from .errors import BundleError, HandoffError, UtterVerifyError
 from .types import BundleVerifyResult, UnitStatus, UnitVerifyResult
 
@@ -47,6 +53,8 @@ class _Unit:
     source_number: int
     renderplan: Path
     render_dir: Path
+    set_entry: Any | None = None
+    plan_set: Any | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -271,10 +279,15 @@ def verify_bundle(
     config_sha256 = hashlib.sha256(config_path.read_bytes()).hexdigest()
 
     units = _resolve_units(identity, variant_name, chapters)
-    prepared: list[tuple[_Unit, Any, Any, tuple[tuple[Any, str, Path], ...], Path]] = []
+    prepared: list[tuple[_Unit, Any, Any, tuple[tuple[Any, str, Path, str], ...], Path]] = []
     for unit in units:
         unit_name = _safe_variant(unit.id)
-        plan, manifest = _load_handoff(unit.renderplan, unit.render_dir)
+        plan, manifest = _load_handoff(
+            unit.renderplan,
+            unit.render_dir,
+            plan_set=unit.plan_set,
+            set_entry=unit.set_entry,
+        )
         verified_wavs = _preflight_loaded(plan, manifest, unit.render_dir)
         unit_output = output_dir / unit_name
         if unit_output.is_symlink():
@@ -334,6 +347,28 @@ def verify_bundle(
                         )
                     )
                 if config.fail_fast and result.status in {"fail", "error"}:
+                    for (
+                        skipped_unit,
+                        skipped_plan,
+                        skipped_manifest,
+                        skipped_wavs,
+                        skipped_output,
+                    ) in prepared[index:]:
+                        results.append(
+                            _not_evaluated_loaded(
+                                skipped_plan,
+                                skipped_manifest,
+                                plan_path=skipped_unit.renderplan,
+                                render_root=skipped_unit.render_dir,
+                                output_dir=skipped_output,
+                                unit_id=skipped_unit.id,
+                                preflight=skipped_wavs,
+                                message=(
+                                    "not evaluated because fail-fast stopped after "
+                                    f"unit {unit.id} failed"
+                                ),
+                            )
+                        )
                     break
     except UtterVerifyError:
         raise
@@ -425,7 +460,16 @@ def _resolve_units(identity: _BundleIdentity, variant: str, chapters: str) -> tu
             continue
         plan = _contained_posix_file(renderplan_variant, entry.renderplan)
         render_dir = _contained_dir(render_variant / entry.id, render_variant)
-        units.append(_Unit(entry.id, entry.source_number, plan, render_dir))
+        units.append(
+            _Unit(
+                entry.id,
+                entry.source_number,
+                plan,
+                render_dir,
+                set_entry=entry,
+                plan_set=plan_set,
+            )
+        )
     return tuple(units)
 
 
@@ -540,6 +584,11 @@ def _write_report(result: BundleVerifyResult) -> None:
         table = tomlkit.table()
         table.add("id", unit.id)
         table.add("status", unit.status)
+        table.add("render_plan_id", unit.render_plan_id)
+        table.add("source_plan_id", unit.source_plan_id)
+        table.add("render_profile_id", unit.render_profile_id)
+        if unit.manifest_id is not None:
+            table.add("manifest_id", unit.manifest_id)
         table.add("renderplan", _rel_or_abs(unit.renderplan, result.bundle))
         table.add("render_dir", _rel_or_abs(unit.render_dir, result.bundle))
         table.add("output_dir", _rel_or_abs(unit.output_dir, result.bundle))
@@ -548,6 +597,23 @@ def _write_report(result: BundleVerifyResult) -> None:
         table.add("reviewed", unit.reviewed)
         table.add("failed", unit.failed)
         table.add("errors", unit.errors)
+        segment_tables = tomlkit.aot()
+        for segment in unit.segments:
+            segment_table = tomlkit.table()
+            segment_table.add("number", segment.number)
+            segment_table.add("segment_id", segment.segment_id)
+            segment_table.add("reference_text", segment.reference_text)
+            segment_table.add("wav", _rel_or_abs(segment.wav, result.bundle))
+            segment_table.add("wav_sha256", segment.wav_sha256)
+            if segment.report is not None:
+                segment_table.add("report", _rel_or_abs(segment.report, result.bundle))
+            segment_table.add("status", segment.status)
+            if segment.language is not None:
+                segment_table.add("language", segment.language)
+            if segment.message is not None:
+                segment_table.add("message", segment.message)
+            segment_tables.append(segment_table)
+        table.add("segment", segment_tables)
         units.append(table)
     doc.add("units", units)
     _atomic_text(result.report_path, tomlkit.dumps(doc))

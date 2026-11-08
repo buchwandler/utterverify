@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import importlib
 import os
+from collections.abc import Mapping
 from dataclasses import asdict, dataclass, replace
+from importlib.metadata import PackageNotFoundError
+from importlib.metadata import version as package_version
 from pathlib import Path
 from typing import Literal
 
@@ -92,7 +95,7 @@ def run_doctor(
         effective_model = None
         model_source = "none"
 
-    _check_import("renderplan", checks, label="renderplan")
+    _check_renderplan(checks)
     speechscope = _import_speechscope(checks)
     backend_info = None
     if speechscope is None:
@@ -217,7 +220,12 @@ def doctor_bundle(
     try:
         units = _resolve_units(identity, selected_variant, "all")
         for unit in units:
-            handoff_plan, handoff_manifest = _load_handoff(unit.renderplan, unit.render_dir)
+            handoff_plan, handoff_manifest = _load_handoff(
+                unit.renderplan,
+                unit.render_dir,
+                plan_set=unit.plan_set,
+                set_entry=unit.set_entry,
+            )
             _preflight_loaded(handoff_plan, handoff_manifest, unit.render_dir)
     except UtterVerifyError:
         raise
@@ -234,20 +242,74 @@ def doctor_bundle(
     )
 
 
-def _check_import(module_name: str, checks: list[DoctorCheck], *, label: str) -> None:
+def _check_renderplan(checks: list[DoctorCheck]) -> None:
+    """Check that installed RenderPlan exposes the handoff contracts we require."""
     try:
-        importlib.import_module(module_name)
+        module = importlib.import_module("renderplan")
     except ImportError as exc:
         checks.append(
             DoctorCheck(
-                label,
+                "renderplan",
                 "fail",
-                f"{module_name} is not importable: {exc}",
-                f"Install {module_name} in the UtterVerify environment.",
+                f"renderplan is not importable: {exc}",
+                "Install UtterVerify and its RenderPlan dependency.",
             )
         )
-    else:
-        checks.append(DoctorCheck(label, "pass", f"{module_name} is importable"))
+        return
+
+    try:
+        version = package_version("renderplan")
+    except PackageNotFoundError:
+        version = getattr(module, "__version__", "unknown version")
+
+    try:
+        contracts = module.supported_contracts()
+    except Exception as exc:  # noqa: BLE001
+        checks.append(
+            DoctorCheck(
+                "renderplan",
+                "fail",
+                f"cannot inspect RenderPlan public contracts: {exc}",
+                "Install renderplan>=0.2.1,<0.3.",
+            )
+        )
+        return
+
+    expected_apis = (
+        "load_manifest",
+        "load_plan",
+        "load_renderplan_set",
+        "validate_manifest_handoff",
+        "validate_renderplan_set",
+        "validate_set_chapter_plan",
+    )
+    missing_apis = [name for name in expected_apis if not callable(getattr(module, name, None))]
+    renderplan_contract = contracts.get("renderplan") if isinstance(contracts, Mapping) else None
+    if renderplan_contract != 2 or missing_apis:
+        problems = []
+        if renderplan_contract != 2:
+            problems.append(
+                f"RenderPlan contract v2 is unsupported (found {renderplan_contract!r})"
+            )
+        if missing_apis:
+            problems.append(f"missing public APIs: {', '.join(missing_apis)}")
+        checks.append(
+            DoctorCheck(
+                "renderplan",
+                "fail",
+                f"renderplan {version}: " + "; ".join(problems),
+                "Install renderplan>=0.2.1,<0.3.",
+            )
+        )
+        return
+
+    checks.append(
+        DoctorCheck(
+            "renderplan",
+            "pass",
+            f"renderplan {version} supports RenderPlan contract v2 and required public handoff APIs",
+        )
+    )
 
 
 def _import_speechscope(checks: list[DoctorCheck]):

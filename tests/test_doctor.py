@@ -62,6 +62,58 @@ def _check_map(result: doctor.DoctorResult) -> dict[str, doctor.DoctorCheck]:
     return {check.name: check for check in result.checks}
 
 
+def test_renderplan_doctor_accepts_v2_public_contract(monkeypatch) -> None:
+    module = SimpleNamespace(supported_contracts=lambda: {"renderplan": 2})
+    for name in (
+        "load_manifest",
+        "load_plan",
+        "load_renderplan_set",
+        "validate_manifest_handoff",
+        "validate_renderplan_set",
+        "validate_set_chapter_plan",
+    ):
+        setattr(module, name, lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        doctor.importlib,
+        "import_module",
+        lambda name: module if name == "renderplan" else _REAL_IMPORT_MODULE(name),
+    )
+    monkeypatch.setattr(doctor, "package_version", lambda _name: "0.2.1")
+
+    checks: list[doctor.DoctorCheck] = []
+    doctor._check_renderplan(checks)
+
+    assert checks[0].status == "pass"
+    assert "renderplan 0.2.1" in checks[0].detail
+    assert "contract v2" in checks[0].detail
+
+
+def test_renderplan_doctor_rejects_unsupported_contract(monkeypatch) -> None:
+    module = SimpleNamespace(supported_contracts=lambda: {"renderplan": 1})
+    for name in (
+        "load_manifest",
+        "load_plan",
+        "load_renderplan_set",
+        "validate_manifest_handoff",
+        "validate_renderplan_set",
+        "validate_set_chapter_plan",
+    ):
+        setattr(module, name, lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        doctor.importlib,
+        "import_module",
+        lambda name: module if name == "renderplan" else _REAL_IMPORT_MODULE(name),
+    )
+    monkeypatch.setattr(doctor, "package_version", lambda _name: "0.1.2")
+
+    checks: list[doctor.DoctorCheck] = []
+    doctor._check_renderplan(checks)
+
+    assert checks[0].status == "fail"
+    assert "contract v2 is unsupported" in checks[0].detail
+    assert checks[0].hint == "Install renderplan>=0.2.1,<0.3."
+
+
 def test_whispercpp_managed_model_and_executable_are_ready(monkeypatch, tmp_path: Path) -> None:
     model_path = tmp_path / "model.bin"
     model_path.write_bytes(b"weights")
@@ -326,7 +378,7 @@ def _stub_bundle_handoff(monkeypatch) -> None:
     monkeypatch.setattr(
         utterverify.core,
         "_load_handoff",
-        lambda *_args: (SimpleNamespace(speech=()), SimpleNamespace(speech=())),
+        lambda *_args, **_kwargs: (SimpleNamespace(speech=()), SimpleNamespace(speech=())),
     )
 
 

@@ -5,13 +5,21 @@
 [AudioCompose](https://github.com/buchwandler/audiocompose). It compares each completed
 VoiceRender speech WAV with the exact RenderPlan speech text by using SpeechScope.
 
+UtterVerify targets RenderPlan 0.2.1 (`renderplan>=0.2.1,<0.3`) and SpeechScope 0.1.1 (`speechscope>=0.1.1,<0.2`).
 It does **not** modify RenderPlans, VoiceRender WAVs, source SSMD, or AudioCompose state.
 
 ## Pipeline
 
 ```text
-UtterPlan -> VoiceRender -> [UtterVerify] -> AudioCompose
-                            optional
+UtterPlan
+  ↓
+RenderPlan
+  ↓
+VoiceRender
+  ↓
+[UtterVerify] (optional)
+  ↓
+AudioCompose
 ```
 
 For bundle workflows, the default sibling layout is:
@@ -102,6 +110,27 @@ side-effect-free dependency metadata preflight and does not prove full runtime/d
 readiness. Doctor exits 0 when ready, 3 when the selected runtime is not ready, and 2 for
 invalid config or bundle input.
 
+#### Optional local whisper.cpp readiness and smoke test
+
+If a whisper.cpp model is already installed, pass its existing file path to Doctor for a read-only readiness check; this does not download, install, move, or overwrite model weights:
+
+```bash
+MODEL="$HOME/.cache/speechscope/whispercpp/tiny.en-q5_1/ggml-tiny.en-q5_1.bin"
+test -r "$MODEL"
+utterverify doctor --engine whispercpp --model "$MODEL"
+```
+
+Doctor checks the executable and model availability/readability without inference. To run an optional ASR smoke test, configure a direct handoff to use that local file and verify a completed RenderPlan/VoiceRender pair:
+
+```bash
+utterverify configure ./verify/chapter --engine whispercpp --model "$MODEL"
+utterverify verify ./renderplan/chapter.renderplan.toml \
+  --render-dir ./voicerender/chapter \
+  --output-dir ./verify/chapter
+```
+
+Only `verify` runs inference. Skip this optional smoke test when no suitable completed handoff is available; no model installation is required.
+
 Then continue with composition only if the gate succeeds:
 
 ```bash
@@ -136,18 +165,20 @@ fail_on_review = false
 fail_fast = false
 ```
 
-This intentionally makes policy a persisted, reviewable input rather than a hidden CLI
-default. Edit it for a less strict gate or a different SpeechScope backend/model.
+This intentionally makes policy a persisted, reviewable input rather than a hidden CLI default. Edit it for a less strict gate or a different SpeechScope backend/model.
+
+This is compound-aware exact-content verification: zero compound-aware lexical error and zero character error do not require strict whitespace-tokenized word-boundary equality. For example, SpeechScope can accept a compound split such as “audiobook” versus “audio book”; this policy is not byte-exact or strict word equality.
 
 ## Handoff checks
 
 Before ASR runs, UtterVerify requires a complete `render-manifest.toml`, validates it
 against the RenderPlan, checks each speech occurrence and deterministic WAV filename,
-rejects symlink/path escapes, and verifies the WAV SHA-256 recorded by VoiceRender.
+rejects symlink/path escapes, and verifies the WAV SHA-256 recorded by VoiceRender before ASR, so stale or replaced audio is rejected before inference.
 SpeechScope then writes one JSON report per segment.
+UtterVerify passes the exact prepared RenderPlan `SpeechItem.text` as SpeechScope's reference text.
+A SpeechScope policy `fail` makes verification exit 1. Backend or input errors exit 2. `review` is a non-pass result requiring attention (including missing timing under the default policy); it exits 0 by default, or 1 when `run.fail_on_review = true`.
 
-A SpeechScope policy `fail` makes the command exit 1. Backend/input errors exit 2. Review
-is exit 0 by default; set `run.fail_on_review = true` to make review block composition.
+Direct and bundle `verify` return 0 for pass or permitted review, 1 for fail or blocking review, and 2 for input/backend errors. `doctor` returns 0 when ready, 3 when runtime readiness checks fail, and 2 for invalid config or bundle input.
 
 ## Low-level one-plan workflow
 

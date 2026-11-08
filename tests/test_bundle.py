@@ -26,10 +26,13 @@ class _Speech:
 class _Plan:
     speech = (_Speech(),)
     plan_id = "sha256:" + "2" * 64
+    source_plan_id = "sha256:" + "3" * 64
+    render_profile_id = "sha256:" + "4" * 64
 
 
 class _Manifest:
     complete = True
+    manifest_id = "sha256:" + "5" * 64
 
     def __init__(self, wav_hash: str) -> None:
         self.speech = (
@@ -48,10 +51,17 @@ class _Manifest:
 _PLAN = _Plan()
 
 
+def _validate_manifest_handoff(plan, manifest, *, require_complete: bool) -> None:
+    assert plan is _PLAN
+    assert require_complete is True
+    assert manifest.complete is True
+
+
 def _install_fake_renderplan(monkeypatch, wav_hash: str) -> None:
     module = ModuleType("renderplan")
     module.load_plan = lambda _path: _PLAN
     module.load_manifest = lambda _path: _Manifest(wav_hash)
+    module.validate_manifest_handoff = _validate_manifest_handoff
     monkeypatch.setitem(sys.modules, "renderplan", module)
 
 
@@ -146,6 +156,15 @@ def test_bundle_creates_config_before_speechscope_backend(monkeypatch, tmp_path:
     assert "model" not in speechscope
     assert speechscope["config_sha256"] == hashlib.sha256(config_path.read_bytes()).hexdigest()
     assert (result.output_dir / "document-0001" / "000001.speechscope.json").is_file()
+    unit_report = report["units"][0]
+    assert unit_report["render_plan_id"] == _PLAN.plan_id
+    assert unit_report["source_plan_id"] == _PLAN.source_plan_id
+    assert unit_report["render_profile_id"] == _PLAN.render_profile_id
+    assert unit_report["manifest_id"] == "sha256:" + "5" * 64
+    segment_report = unit_report["segment"][0]
+    assert segment_report["reference_text"] == _Speech.text
+    assert segment_report["wav_sha256"] == "sha256:" + hashlib.sha256(wav.read_bytes()).hexdigest()
+    assert segment_report["status"] == "pass"
 
 
 def test_checksum_mismatch_fails_before_asr(monkeypatch, tmp_path: Path) -> None:
@@ -214,18 +233,54 @@ def test_book_bundle_selects_source_number(monkeypatch, tmp_path: Path) -> None:
     module.validate_renderplan_set = lambda _value: None
     module.load_plan = lambda path: plans[str(Path(path).resolve())]
     module.load_manifest = lambda path: manifests[str(Path(path).resolve())]
+    module.validate_manifest_handoff = _validate_manifest_handoff
+    module.validate_set_chapter_plan = lambda _set, _entry, _plan: None
     monkeypatch.setitem(sys.modules, "renderplan", module)
 
     config_path = root / "utterverify" / variant / "utterverify.toml"
     _install_fake_speechscope(monkeypatch, config_path)
     result = verify_bundle(root, variant=variant, chapters="6")
+    import pytest
+
+    from utterverify.errors import HandoffError
+
+    original_load_manifest = module.load_manifest
+
+    def reject_set_identity(*_args):
+        raise ValueError("chapter identity mismatch")
+
+    module.validate_set_chapter_plan = reject_set_identity
+    module.load_manifest = lambda _path: pytest.fail("manifest must not load before set identity")
+    with pytest.raises(HandoffError, match="chapter identity mismatch"):
+        verify_bundle(root, variant=variant, chapters="6")
+    module.load_manifest = original_load_manifest
+    module.validate_set_chapter_plan = lambda _set, _entry, _plan: None
 
     assert [unit.id for unit in result.units] == ["chapter-0006"]
     assert result.status == "pass"
 
-    import pytest
-
     import utterverify.bundle as bundle_module
+
+    configure_bundle(root, variant=variant, fail_fast=True)
+
+    class FailVerifier:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def analyze(self, _request):
+            return SimpleNamespace(
+                evaluation={"status": "fail"},
+                write_json=lambda path: Path(path).write_text("{}", encoding="utf-8"),
+            )
+
+    monkeypatch.setattr(bundle_module, "_open_verifier", lambda _config: FailVerifier())
+    fail_fast_result = verify_bundle(root, variant=variant, chapters="all")
+    assert [unit.id for unit in fail_fast_result.units] == ["chapter-0005", "chapter-0006"]
+    assert fail_fast_result.units[0].segments[0].status == "fail"
+    assert fail_fast_result.units[1].segments[0].status == "not_evaluated"
 
     bad_manifest = str((render_variant / "chapter-0006" / "render-manifest.toml").resolve())
     manifests[bad_manifest] = _Manifest("0" * 64)

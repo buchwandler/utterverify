@@ -13,7 +13,7 @@ license-files = ["LICENSE"]
 authors = [{name = "buchwandler"}]
 keywords = ["speech", "tts", "validation", "speechscope", "renderplan", "audio"]
 dependencies = [
-  "renderplan>=0.1.2,<0.2",
+  "renderplan>=0.2.1,<0.3",
   "speechscope>=0.1.1,<0.2",
   "tomlkit>=0.13,<1",
 ]
@@ -28,7 +28,7 @@ classifiers = [
 ]
 
 [project.optional-dependencies]
-redux = ["speechscope[redux]>=0.1.0,<0.2"]
+redux = ["speechscope[redux]>=0.1.1,<0.2"]
 dev = [
   "build>=1.2",
   "mypy>=1.13",

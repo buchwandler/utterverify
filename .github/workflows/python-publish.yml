@@ -1,0 +1,170 @@
+name: Validate and publish 0.1.0
+
+on:
+  push:
+    tags:
+      - "v0.1.0"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  tests:
+    name: Tests and static checks (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]
+    steps:
+      - name: Check out the release tag
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref }}
+          fetch-depth: 0
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install development dependencies
+        run: python -m pip install -e '.[dev]'
+      - name: Run tests
+        run: python -m pytest -q
+      - name: Run Ruff lint
+        run: ruff check .
+      - name: Check Ruff formatting
+        run: ruff format --check utterverify tests
+      - name: Run mypy
+        run: mypy utterverify
+      - name: Compile package
+        run: python -m compileall -q utterverify
+
+  build:
+    name: Build and validate distributions
+    needs: tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the release tag
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref }}
+          fetch-depth: 0
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install build tooling
+        run: python -m pip install --upgrade build packaging twine
+      - name: Build wheel and source distribution
+        run: python -m build
+      - name: Check distribution metadata
+        run: python -m twine check dist/*
+      - name: Validate version, dependencies, and packaged files
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          python - <<'PY'
+          import os
+          import re
+          import tarfile
+          import zipfile
+          from email import policy
+          from email.parser import Parser
+          from pathlib import Path
+
+          from packaging.specifiers import SpecifierSet
+          from packaging.requirements import Requirement
+
+          tag = os.environ["RELEASE_TAG"]
+          assert tag == "v0.1.0", tag
+          version = tag.removeprefix("v")
+          artifacts = list(Path("dist").iterdir())
+          wheels = [path for path in artifacts if path.suffix == ".whl"]
+          sdists = [path for path in artifacts if path.name.endswith(".tar.gz")]
+          assert len(wheels) == 1, wheels
+          assert len(sdists) == 1, sdists
+
+          wheel_match = re.fullmatch(
+              r"utterverify-([^-]+)-[^-]+-[^-]+-[^-]+\.whl", wheels[0].name
+          )
+          sdist_match = re.fullmatch(r"utterverify-([^-]+)\.tar\.gz", sdists[0].name)
+          assert wheel_match is not None, wheels[0]
+          assert sdist_match is not None, sdists[0]
+          assert wheel_match.group(1) == version, (wheel_match.group(1), version)
+          assert sdist_match.group(1) == version, (sdist_match.group(1), version)
+
+          with zipfile.ZipFile(wheels[0]) as archive:
+              metadata_name = next(
+                  name for name in archive.namelist() if name.endswith(".dist-info/METADATA")
+              )
+              metadata = Parser(policy=policy.default).parsestr(
+                  archive.read(metadata_name).decode("utf-8")
+              )
+              assert metadata["Name"] == "utterverify"
+              assert metadata["Version"] == version
+              requirements = [
+                  Requirement(value) for value in metadata.get_all("Requires-Dist", [])
+              ]
+              renderplan = [req for req in requirements if req.name.lower() == "renderplan"]
+              assert len(renderplan) == 1, requirements
+              specifier = renderplan[0].specifier
+              assert specifier == SpecifierSet(">=0.2.1,<0.3"), specifier
+              names = set(archive.namelist())
+              assert {
+                  "utterverify/py.typed",
+                  "utterverify/cli.py",
+                  "utterverify/__main__.py",
+              } <= names
+
+          with tarfile.open(sdists[0], "r:gz") as archive:
+              pkg_info_name = next(
+                  name for name in archive.getnames() if name.endswith("/PKG-INFO")
+              )
+              pkg_info = Parser(policy=policy.default).parsestr(
+                  archive.extractfile(pkg_info_name).read().decode("utf-8")
+              )
+              assert pkg_info["Name"] == "utterverify"
+              assert pkg_info["Version"] == version
+          PY
+      - name: Smoke-test the wheel in a clean environment
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          smoke_env="$RUNNER_TEMP/utterverify-wheel-smoke"
+          python -m venv "$smoke_env"
+          "$smoke_env/bin/python" -m pip install dist/*.whl
+          test "$("$smoke_env/bin/utterverify" --version)" = "utterverify ${RELEASE_TAG#v}"
+          "$smoke_env/bin/utterverify" --help >/dev/null
+      - name: Upload validated distributions
+        uses: actions/upload-artifact@v4
+        with:
+          name: utterverify-dist-v0.1.0
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: Publish validated distributions to PyPI
+    needs: build
+    if: github.ref == 'refs/tags/v0.1.0'
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/p/utterverify
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Download validated distributions
+        uses: actions/download-artifact@v4
+        with:
+          name: utterverify-dist-v0.1.0
+          path: dist/
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist/
