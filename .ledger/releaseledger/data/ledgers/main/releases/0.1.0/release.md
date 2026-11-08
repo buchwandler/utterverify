@@ -3,16 +3,16 @@ schema_version: 2
 object_type: release
 versioning:
   schema_version: 1
-  revision: 7
+  revision: 8
 version: 0.1.0
-status: planned
+status: released
 history_state: curated
 title: UtterVerify 0.1.0
-released_at: null
+released_at: "2026-11-08"
 previous_version: null
 cancel_reason: null
 superseded_by: null
-changelog_file: CHANGELOG.md
+changelog_file: docs/changelog.md
 boundary_ref: null
 source_refs: []
 source_count: null
